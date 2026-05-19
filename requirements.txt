@@ -1,0 +1,34 @@
+# ── Web Framework ──────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0          # ASGI server (replaces Flask dev server)
+
+# ── Authentication ──────────────────────────────────────────────────────────
+PyJWT>=2.8.0                        # Stateless JWT (access + refresh tokens)
+passlib[bcrypt]>=1.7.4              # Password hashing (replaces werkzeug)
+python-multipart>=0.0.9             # FastAPI form parsing (OAuth2 password flow)
+pydantic[email]>=2.7.0              # EmailStr validator in RegisterRequest
+
+# ── Async Database (MySQL via SQLModel + Alembic) ───────────────────────────
+sqlmodel>=0.0.18                    # SQLAlchemy 2.0 + Pydantic ORM
+aiomysql>=0.2.0                     # Async MySQL driver for SQLAlchemy
+cryptography>=42.0.0                # Required by aiomysql for TLS/auth
+alembic>=1.13.0                     # Database migration management
+
+# ── Task Queue & Message Broker ─────────────────────────────────────────────
+taskiq>=0.11.0
+taskiq-redis>=0.5.0                 # Redis broker + result backend
+redis[hiredis]>=5.0.4               # Low-level async Redis client (pub/sub for SSE)
+
+# ── Real-time SSE ────────────────────────────────────────────────────────────
+sse-starlette>=2.1.0
+
+# ── AI — vLLM via OpenAI-compatible API ─────────────────────────────────────
+openai>=1.30.0                      # Points to vLLM server, NOT OpenAI cloud
+
+# ── Scanner internals (unchanged) ────────────────────────────────────────────
+requests>=2.32.3
+beautifulsoup4>=4.13.3
+urllib3>=2.3.0
+aiohttp>=3.11.0
+
+# ── Removed: Flask, flask-cors, werkzeug, ollama ─────────────────────────────
