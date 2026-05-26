@@ -32,6 +32,8 @@ import tempfile
 import textwrap
 from typing import Optional
 
+from bs4 import BeautifulSoup
+
 from dotenv import load_dotenv
 load_dotenv()   # must run before AsyncOpenAI reads VLLM_BASE_URL from os.getenv
 
@@ -45,6 +47,97 @@ _vllm_client = AsyncOpenAI(
     base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
     api_key=os.getenv("VLLM_API_KEY", "not-needed"),
 )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# WAF PRE-DETECTION
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def detect_waf(target_url: str) -> dict:
+    """
+    Lightweight async WAF / CDN detection probe.
+
+    Sends a single benign GET request to the target root URL and inspects
+    the response headers and body for known WAF signatures.
+
+    Returns a dict:
+        {
+            "detected": bool,
+            "name":     str,    # e.g. "Cloudflare", "Akamai"
+            "signals":  list,   # human-readable list of detected signals
+        }
+
+    This is called once at the very start of run_ai_scan_task so the result
+    can be passed to all AI vulnerability agents — they then apply evasion
+    techniques on Attempt 1 rather than wasting Attempt 1 on a plain probe.
+    """
+    import aiohttp
+
+    WAF_SIGNATURES = [
+        # (header_name_lower, header_value_substr, WAF name)
+        ("cf-ray",               None,           "Cloudflare"),
+        ("server",               "cloudflare",   "Cloudflare"),
+        ("x-sucuri-id",          None,           "Sucuri"),
+        ("x-sucuri-cache",       None,           "Sucuri"),
+        ("x-fw-hash",            None,           "Fastly WAF"),
+        ("x-cache",              "imperva",      "Imperva Incapsula"),
+        ("x-iinfo",              None,           "Imperva Incapsula"),
+        ("x-amz-cf-id",          None,           "AWS CloudFront"),
+        ("x-akamai-request-id", None,            "Akamai"),
+        ("x-cdn",                "akamai",       "Akamai"),
+        ("x-denied-reason",      None,           "Generic WAF"),
+        ("x-waf-status",         None,           "Generic WAF"),
+    ]
+
+    BODY_SIGNATURES = [
+        ("cloudflare",          "Cloudflare"),
+        ("access denied",       "Generic WAF"),
+        ("blocked by",          "Generic WAF"),
+        ("security check",      "Generic WAF"),
+        ("ddos protection",     "DDoS Protection"),
+    ]
+
+    detected = False
+    waf_name = "Unknown WAF"
+    signals: list = []
+
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                target_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=8),
+                ssl=False,
+                allow_redirects=True,
+            ) as resp:
+                resp_headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
+                body_snippet = (await resp.text(errors="replace"))[:1000].lower()
+
+                for hdr, val_substr, name in WAF_SIGNATURES:
+                    if hdr in resp_headers:
+                        if val_substr is None or val_substr in resp_headers[hdr]:
+                            detected = True
+                            waf_name = name
+                            signals.append(f"Header '{hdr}' detected ({name})")
+
+                for pattern, name in BODY_SIGNATURES:
+                    if pattern in body_snippet:
+                        detected = True
+                        waf_name = name
+                        signals.append(f"Body pattern '{pattern}' detected ({name})")
+
+    except Exception:
+        pass  # Network error — assume no WAF so scan continues normally
+
+    return {"detected": detected, "name": waf_name, "signals": signals}
 
 # ── LoRA adapter IDs (registered with the vLLM server at startup) ─────────────
 ANALYST_ADAPTER  = os.getenv("ANALYST_ADAPTER",  "vultix-analyst-lora")
@@ -183,7 +276,7 @@ async def _chat_async(adapter_id: str, system: str, messages: list) -> str:
             model=adapter_id,
             messages=[{"role": "system", "content": system}, *messages],
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=1024,   # Scripts/reviews rarely exceed 700 tokens; prevents runaway generation on local 8B model
         ),
         timeout=AI_CALL_TIMEOUT,
     )
@@ -204,10 +297,60 @@ def _extract_python_code(text: str) -> Optional[str]:
     return None
 
 
+def _clean_executor_output(raw: str) -> str:
+    """
+    Deterministic HTML boilerplate stripper for Executor script outputs.
+
+    Runs BEFORE the Analyst ever sees the output, ensuring the local 8B model
+    only receives high-signal text — never raw CSS, SVG blobs, or inline scripts.
+    This protects the 6GB RTX 4050 VRAM budget and maximises Analyst accuracy.
+
+    Rules:
+      • Errors and STDERR pass through untouched (the Analyst needs full context).
+      • Non-HTML outputs pass through untouched (JSON, plain-text, headers, etc.).
+      • HTML outputs are parsed, noisy tags are decomposed, and clean text is
+        truncated to 1 200 characters — comfortably within a 3 072-token context.
+    """
+    # Always preserve error payloads in full so the Analyst can diagnose them.
+    if "[STDERR]" in raw or "EXECUTOR_ERROR" in raw:
+        return raw
+
+    # Only apply HTML parsing when the output actually contains HTML markup.
+    html_indicators = ("<html", "<body", "<div", "<span", "<p>", "<!doctype")
+    if not any(indicator in raw.lower() for indicator in html_indicators):
+        return raw  # Plain-text / JSON / header output — return as-is.
+
+    try:
+        soup = BeautifulSoup(raw, "html.parser")
+
+        # Remove noisy, non-semantic tags that waste VRAM and confuse the model.
+        for tag in soup(["style", "script", "svg", "path", "link", "iframe",
+                         "noscript", "meta", "head"]):
+            tag.decompose()
+
+        # Extract clean, readable text from the remaining DOM.
+        clean_text = soup.get_text(separator="\n")
+
+        # Collapse multiple consecutive blank lines into a single line break.
+        clean_text = re.sub(r"\n{2,}", "\n", clean_text).strip()
+
+        # Truncate to a VRAM-safe length for the 6GB RTX 4050.
+        if len(clean_text) > 1200:
+            clean_text = clean_text[:1200]
+
+        return f"[CLEANED HTML CONTENT (VRAM Safe)]\n{clean_text}"
+
+    except Exception:
+        # Parser failure — fall back to simple truncation so the scan never crashes.
+        return raw[:1000]
+
+
 def _run_python_code(code: str, timeout: int = 25) -> str:
     """
     Write generated code to a temp file and run it in a subprocess.
-    Returns combined stdout + stderr. Safe to call from asyncio.to_thread().
+    Returns combined stdout + stderr, with HTML boilerplate stripped via
+    _clean_executor_output() before being passed to the Analyst Agent.
+    Safe to call from asyncio.to_thread().
     """
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
@@ -225,7 +368,14 @@ def _run_python_code(code: str, timeout: int = 25) -> str:
         output = result.stdout
         if result.stderr.strip():
             output += "\n[STDERR]\n" + result.stderr
-        return output.strip() or "[No output from script]"
+
+        raw = output.strip() or "[No output from script]"
+
+        # ── Strip HTML boilerplate before the Analyst reads the output ──────────
+        # This is the single most impactful accuracy improvement for a 6GB GPU:
+        # the 8B Analyst model receives only clean, high-signal text.
+        return _clean_executor_output(raw)
+
     except subprocess.TimeoutExpired:
         return "[EXECUTOR_ERROR: Script timed out after 25 seconds]"
     except Exception as exc:
@@ -333,19 +483,31 @@ _AI_ONLY_TYPES = [
 ]
 
 
-def _run_local_fallback(target_url: str, vuln_type: str, session, stop_event=None) -> list:
+def _run_local_fallback(
+    target_url: str,
+    vuln_type: str,
+    session,
+    stop_event=None,
+    crawl_data: Optional[dict] = None,
+) -> list:
     """
     Run the appropriate local scanner as a fallback when AI is inconclusive.
     Sync function — called via asyncio.to_thread() in the scan loop below.
     Returns a list of vulnerability dicts in the standard format.
+
+    crawl_data: if provided (passed from run_ai_scan_task), the crawler is
+                skipped entirely — eliminating the most expensive redundant
+                operation in the fallback path.
     """
     vuln_lower = vuln_type.lower()
 
     if any(kw in vuln_lower for kw in _AI_ONLY_TYPES):
         return []  # No local scanner for AI-only types
 
-    crawler    = Crawler(target_url)
-    crawl_data = crawler.crawl()
+    # Reuse pre-fetched crawl data if available; otherwise crawl fresh.
+    if crawl_data is None:
+        crawl_data = Crawler(target_url).crawl()
+
     pages            = crawl_data.get("pages", [])
     forms            = crawl_data.get("forms", [])
     urls_with_params = crawl_data.get("urls_with_params", [])
@@ -372,6 +534,13 @@ def _run_local_fallback(target_url: str, vuln_type: str, session, stop_event=Non
         s.run_all(target_url, pages, forms, urls_with_params)
         return s.get_results()
 
+    if "ssti" in vuln_lower or "template injection" in vuln_lower:
+        from scanner.ssti_scanner import SSTIScanner
+        s = SSTIScanner(session=session)
+        for u in urls_with_params: s.scan_url_params(u)
+        for f in forms:            s.scan_form(f)
+        return s.get_results()
+
     return []  # Unknown type — safe default
 
 
@@ -384,7 +553,9 @@ async def scan_vulnerability_with_ai(
     vuln_type: str,
     max_attempts: int = 2,
     cancel_event: Optional[asyncio.Event] = None,
-    stop_event=None,   # threading.Event — kills blocking subprocesses immediately
+    stop_event=None,           # threading.Event — kills blocking subprocesses immediately
+    crawl_data: Optional[dict] = None,   # pre-fetched crawl data — skip re-crawling in fallbacks
+    waf_info: Optional[dict] = None,     # result of detect_waf() — enables Attempt-1 evasion
 ) -> dict:
     """
     Async AI-powered scan loop for a single vulnerability type.
@@ -432,7 +603,17 @@ async def scan_vulnerability_with_ai(
     if cancel_event and cancel_event.is_set():
         return result
 
-    plan_prompt = f"Target: {target_url}\nVulnerability Type: {vuln_type}"
+    # Build the planning prompt, injecting WAF evasion hint if detected
+    waf_hint = ""
+    if waf_info and waf_info.get("detected"):
+        waf_hint = (
+            f"\n\nIMPORTANT: A WAF/firewall ({waf_info.get('name', 'Unknown')}) "
+            "has been detected on this target. Apply evasion techniques "
+            "(URL encoding, browser-like headers, payload fragmentation) "
+            "starting from Attempt 1 — do NOT send a plain probe first."
+        )
+
+    plan_prompt = f"Target: {target_url}\nVulnerability Type: {vuln_type}{waf_hint}"
     log.append(f"[Analyst] Planning: {vuln_type} on {target_url}")
 
     try:
@@ -446,7 +627,7 @@ async def scan_vulnerability_with_ai(
         result["method"]   = "fallback"
         if not (cancel_event and cancel_event.is_set()):
             result["findings"] = await asyncio.to_thread(
-                _run_local_fallback, target_url, vuln_type, session, stop_event
+                _run_local_fallback, target_url, vuln_type, session, stop_event, crawl_data
             )
         return result
 
@@ -540,12 +721,14 @@ async def scan_vulnerability_with_ai(
         else:
             break  # FALLBACK_TRIGGERED or last attempt
 
-    # ── AI inconclusive — run local fallback ──────────────────────────────────
+    # ── AI inconclusive — run local fallback (with cached crawl data) ─────────
     log.append(f"[FALLBACK] AI inconclusive for {vuln_type}")
     result["method"] = "fallback"
     if not (cancel_event and cancel_event.is_set()):
+        # Pass crawl_data so the fallback does NOT re-crawl the target.
+        # This is the single biggest performance win in the AI pipeline.
         result["findings"] = await asyncio.to_thread(
-            _run_local_fallback, target_url, vuln_type, session, stop_event
+            _run_local_fallback, target_url, vuln_type, session, stop_event, crawl_data
         )
     return result
 
@@ -574,6 +757,8 @@ VULN_TYPES = [
     "Business Logic & API Endpoint Discovery",
     "HTTP Parameter Pollution (HPP)",
     "XML External Entity (XXE) Injection",
+    # Deterministic SSTI — local fallback available via SSTIScanner
+    "Server-Side Template Injection (SSTI)",
 ]
 
 

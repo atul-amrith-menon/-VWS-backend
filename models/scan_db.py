@@ -37,6 +37,7 @@ _CRITICAL_TYPES = {
     "Cross-Site Scripting (XSS)",
     "Directory Traversal",
     "Sensitive Data Exposure",
+    "Server-Side Template Injection (SSTI)",  # RCE-capable — highest severity
 }
 
 
@@ -194,6 +195,17 @@ async def delete_scan(scan_id: int, user_id: int) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # Vulnerability CRUD
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def delete_scan_vulnerabilities(scan_id: int) -> None:
+    """
+    Delete all vulnerability rows for a scan.
+    Called by the AI pipeline to clear incremental saves before re-inserting
+    the final deduplicated set, ensuring no duplicate rows persist.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM vulnerabilities WHERE scan_id = ?", (scan_id,))
+        await db.commit()
+
 
 async def save_vulnerability(scan_id: int, vuln: dict) -> None:
     """Insert a single vulnerability record linked to a scan."""

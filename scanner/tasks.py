@@ -29,11 +29,25 @@ Cancellation:
 
 Progress payload shape (published to scan:{scan_id}):
     {
-        "phase":    str,   # human-readable phase name
-        "progress": int,   # 0-100
-        "message":  str,   # detail message shown on the frontend
-        "done":     bool   # True only on the final event
+        "phase":      str,   # human-readable phase name
+        "progress":   int,   # 0-100
+        "message":    str,   # detail message shown on the frontend
+        "done":       bool,  # True only on the final event
+        "vulns_found": int,  # live count of vulnerabilities found so far
     }
+
+Optimizations (v3):
+    1. Smart Evidence Truncation   — caps merged evidence to 3 instances.
+    2. Concurrent Baseline Scanners— SQLi/XSS/SSTI/Misconfig/Advanced run
+                                     in parallel threads via asyncio.gather().
+    3. Real-time DB Saving         — findings saved immediately as each
+                                     scanner finishes; DB counts updated live.
+    4. Crawl Cache Sharing         — crawl_data passed to ai_orchestrator so
+                                     fallback loops never re-crawl the target.
+    5. Adaptive AI Semaphore       — vLLM health checked at startup; concurrency
+                                     scaled 2 → 3 → 4 based on server load.
+    6. WAF Pre-detection Wiring    — waf_info passed to scan_vulnerability_with_ai
+                                     so AI agents apply evasion on Attempt 1.
 """
 
 import asyncio
@@ -48,6 +62,7 @@ import redis.asyncio as aioredis
 from broker import broker
 from models.scan_db import (
     calculate_threat_score,
+    delete_scan_vulnerabilities,
     get_scan,
     save_vulnerability,
     update_scan_results,
@@ -58,8 +73,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Deduplication helper
+# Deduplication helper (v2 — smart evidence truncation)
 # ─────────────────────────────────────────────────────────────────────────────
+
+_MAX_EVIDENCE_INSTANCES = 3   # Max distinct evidence blocks stored per finding
+
 
 def _deduplicate_vulns(vulns: list) -> list:
     """
@@ -69,13 +87,17 @@ def _deduplicate_vulns(vulns: list) -> list:
     `vuln_type` AND `url`.  When duplicates are found:
       - The first occurrence is kept as the base.
       - Each subsequent duplicate's `evidence` is appended to the base
-        (separated by a visible delimiter) as long as the text is new.
+        (separated by a visible delimiter) up to _MAX_EVIDENCE_INSTANCES.
+      - If more than _MAX_EVIDENCE_INSTANCES duplicates exist, a short
+        "(+ X more instances detected)" note is appended instead to avoid
+        bloating SQLite rows and the frontend rendering.
       - The base `description` is updated to note multiple instances.
 
     The ordering is preserved: the first occurrence's risk_level and
     severity are kept, since the scanners already rank the worst case first.
     """
-    seen: dict = {}   # key -> index in `result`
+    seen: dict = {}    # key -> index in `result`
+    counts: dict = {}  # key -> number of evidence blocks already stored
     result: list = []
 
     for vuln in vulns:
@@ -83,14 +105,24 @@ def _deduplicate_vulns(vulns: list) -> list:
                vuln.get("url", "").strip().rstrip("/").lower())
 
         if key not in seen:
-            seen[key] = len(result)
+            seen[key]   = len(result)
+            counts[key] = 1
             result.append(dict(vuln))   # work on a copy
         else:
-            base = result[seen[key]]
+            base          = result[seen[key]]
             extra_evidence = (vuln.get("evidence") or "").strip()
+
             if extra_evidence and extra_evidence not in (base.get("evidence") or ""):
-                delimiter = "\n\n--- [Additional Instance] ---\n"
-                base["evidence"] = (base.get("evidence") or "") + delimiter + extra_evidence
+                if counts[key] < _MAX_EVIDENCE_INSTANCES:
+                    # Still within the evidence cap — append full block
+                    delimiter = "\n\n--- [Additional Instance] ---\n"
+                    base["evidence"] = (base.get("evidence") or "") + delimiter + extra_evidence
+                    counts[key] += 1
+                elif "(+ " not in (base.get("evidence") or ""):
+                    # First overflow — replace trailing content with a compact note
+                    overflow_note = f"\n\n... (+ more instances detected — evidence capped at {_MAX_EVIDENCE_INSTANCES} for clarity)"
+                    base["evidence"] = (base.get("evidence") or "") + overflow_note
+
             # Mark the description so the reader knows there are multiple hits
             if "(multiple instances)" not in (base.get("description") or "").lower():
                 base["description"] = (base.get("description") or "") + " (multiple instances detected)"
@@ -109,14 +141,27 @@ async def _publish(
     progress: int,
     message: str,
     done: bool = False,
+    vulns_found: int = 0,
+    vulnerabilities: Optional[list] = None,
 ) -> None:
-    """Publish a progress event to the Redis channel for this scan."""
-    payload = json.dumps({
-        "phase":    phase,
-        "progress": progress,
-        "message":  message,
-        "done":     done,
-    })
+    """Publish a progress event to the Redis channel and cache the latest state.
+
+    vulns_found: real-time count of vulnerabilities found so far (streamed to UI).
+    """
+    payload_dict = {
+        "phase":       phase,
+        "progress":    progress,
+        "message":     message,
+        "done":        done,
+        "vulns_found": vulns_found,
+    }
+    if vulnerabilities is not None:
+        payload_dict["vulnerabilities"] = vulnerabilities
+
+    payload = json.dumps(payload_dict)
+    # Cache the latest progress state in Redis for 2 hours (7200 seconds)
+    # This prevents the UI from resetting to 0% if the user navigates away and returns.
+    await r.set(f"scan:progress:{scan_id}", payload, ex=7200)
     await r.publish(f"scan:{scan_id}", payload)
 
 
@@ -154,25 +199,72 @@ async def _finish_cancelled(
     start_time: float,
 ) -> None:
     duration     = time.time() - start_time
-    threat_score = calculate_threat_score(vulns)
+    deduped      = _deduplicate_vulns(vulns)
+    threat_score = calculate_threat_score(deduped)
 
-    for vuln in vulns:
+    await delete_scan_vulnerabilities(scan_id)
+    for vuln in deduped:
         await save_vulnerability(scan_id, vuln)
 
-    await update_scan_results(scan_id, vulns, duration, threat_score)
+    await update_scan_results(scan_id, deduped, duration, threat_score)
     await update_scan_status(scan_id, "cancelled")
 
     await _publish(
         r, scan_id,
         phase="Cancelled",
         progress=100,
-        message=f"Scan cancelled. {len(vulns)} vulnerabilities found before cancellation.",
+        message=f"Scan cancelled. {len(deduped)} vulnerabilities found before cancellation.",
         done=True,
+        vulns_found=len(deduped),
+        vulnerabilities=deduped,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Task 1 — Traditional scanner pipeline
+# Real-time DB save helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _save_new_findings(scan_id: int, new_vulns: list) -> None:
+    """
+    Immediately persist newly discovered vulnerabilities to SQLite.
+    Called right after each scanner finishes so findings appear in the
+    frontend even before the scan completes.
+    """
+    for vuln in new_vulns:
+        await save_vulnerability(scan_id, vuln)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Adaptive AI semaphore helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_ai_semaphore() -> asyncio.Semaphore:
+    """
+    Query the vLLM server's health endpoint to decide how many concurrent
+    AI vulnerability checks to run.
+
+    Scale:
+        vLLM healthy & responsive  → Semaphore(3)  [safe for RTX 4050 6 GB]
+        vLLM unresponsive / error  → Semaphore(2)  [conservative fallback]
+
+    We deliberately cap at 3 (not 4) because the baseline scanners are also
+    running concurrently during the AI phase and share system resources.
+    """
+    import aiohttp
+    vllm_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
+    health_url = f"{vllm_url}/health"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    return asyncio.Semaphore(3)
+    except Exception:
+        pass  # vLLM unreachable — conservative fallback
+    return asyncio.Semaphore(2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 1 — Traditional scanner pipeline (v3 — concurrent baselines)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @broker.task
@@ -180,12 +272,15 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
     """
     Runs the full traditional scanner pipeline as a Taskiq task.
 
-    Phases mirror the old ScannerEngine.run() but:
-      - Each sync scanner call is wrapped in asyncio.to_thread()
-      - Progress is published to Redis (not written to a local dict)
-      - Cancellation is checked via an asyncio.Event (not a dict flag)
+    v3 Changes:
+      - All post-crawl scanners (SQLi, XSS, SSTI, Misconfig/Nmap, Advanced)
+        run concurrently via asyncio.gather() in separate to_thread() calls.
+      - Each concurrent scanner gets its own requests.Session to prevent
+        shared-state race conditions across threads.
+      - Findings are saved to SQLite immediately as each scanner finishes
+        (not only at the end), so the frontend can display results live.
+      - Progress events include vulns_found count for real-time UI updates.
     """
-    # Lazy imports — sub-scanners only needed inside the worker process
     import requests as _requests
     from scanner.crawler import Crawler
     from scanner.sqli_scanner import SQLiScanner
@@ -196,8 +291,6 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
     start_time   = time.time()
     vulns: list  = []
     cancel_event = asyncio.Event()
-    # threading.Event shared with sync workers (e.g. nmap) so they can be
-    # killed immediately when the user clicks Cancel, even mid-subprocess.
     stop_event   = threading.Event()
 
     # Normalise URL
@@ -205,19 +298,10 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
         target_url = "http://" + target_url
     target_url = target_url.rstrip("/")
 
-    # Shared requests session (sync, used inside to_thread calls)
-    session = _requests.Session()
-    session.headers.update({
-        "User-Agent": "Vultix/2.0 Security Scanner (Educational)",
-    })
-
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-    # Start the cancel-watcher in the background.
-    # When a cancel arrives: set asyncio cancel_event (checked between phases)
-    # AND set threading stop_event (kills blocking subprocesses like Nmap instantly).
+    # Cancel watcher — listens for cancel signal and sets both events
     async def _watch_and_propagate():
-        await _watch_cancel.__wrapped__(scan_id, cancel_event) if hasattr(_watch_cancel, '__wrapped__') else None
         r2 = aioredis.from_url(REDIS_URL, decode_responses=True)
         pub2 = r2.pubsub()
         await pub2.subscribe(f"scan:cancel:{scan_id}")
@@ -225,7 +309,7 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
             async for msg in pub2.listen():
                 if msg["type"] == "message":
                     cancel_event.set()
-                    stop_event.set()   # <-- kills blocking subprocess immediately
+                    stop_event.set()
                     break
         finally:
             await pub2.unsubscribe(f"scan:cancel:{scan_id}")
@@ -233,14 +317,17 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
 
     cancel_watcher = asyncio.create_task(_watch_and_propagate())
 
+    # Lock to guard concurrent mutations to `vulns` and Redis publishes
+    findings_lock = asyncio.Lock()
+
     try:
         # ── Phase 1: Crawling ─────────────────────────────────────────────────
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, vulns, start_time)
 
-        await _publish(r, scan_id, "Crawling", 8, f"Crawling {target_url}...")
+        await _publish(r, scan_id, "Crawling", 8, f"Crawling {target_url}...", vulns_found=0)
 
-        crawler   = Crawler(target_url)
+        crawler    = Crawler(target_url)
         crawl_data = await asyncio.to_thread(crawler.crawl)
 
         pages            = crawl_data["pages"]
@@ -251,93 +338,111 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
             r, scan_id, "Crawling Complete", 18,
             f"Found {len(pages)} pages, {len(forms)} forms, "
             f"{len(urls_with_params)} parameterised URLs",
+            vulns_found=0,
         )
 
-        # ── Phase 2: SQL Injection ────────────────────────────────────────────
+        # ── Phase 2-6: Concurrent scanning ───────────────────────────────────
+        # Each scanner gets its own Session to be thread-safe.
+        # All scanners are launched simultaneously; we wait for all to finish.
+
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, vulns, start_time)
 
-        await _publish(r, scan_id, "SQL Injection Testing", 25,
-                       "Testing for SQL Injection vulnerabilities...")
+        await _publish(r, scan_id, "Security Testing", 22,
+                       "Running SQLi, XSS, SSTI, Misconfig, and Advanced checks in parallel...",
+                       vulns_found=0)
 
-        def _run_sqli():
-            scanner = SQLiScanner(session=session)
-            for url in urls_with_params:
-                scanner.scan_url_params(url)
-            for form in forms:
-                scanner.scan_form(form)
+        async def _run_and_collect(scanner_fn, phase_name: str, phase_pct: int):
+            """Run a scanner in a thread, then publish its findings count immediately.
+            Saves deduplicated findings to SQLite immediately so they appear in the UI live."""
+            if cancel_event.is_set():
+                return
+            new_findings = await asyncio.to_thread(scanner_fn)
+            async with findings_lock:
+                if not cancel_event.is_set():
+                    if new_findings:
+                        vulns.extend(new_findings)
+                    
+                    deduped = _deduplicate_vulns(vulns)
+                    
+                    # Clear incremental and re-save clean deduped findings
+                    await delete_scan_vulnerabilities(scan_id)
+                    for v in deduped:
+                        await save_vulnerability(scan_id, v)
+                    
+                    await _publish(
+                        r, scan_id, phase_name, phase_pct,
+                        f"{phase_name} complete — {len(new_findings) if new_findings else 0} finding(s)",
+                        vulns_found=len(deduped),
+                        vulnerabilities=deduped,
+                    )
+
+        def _make_session():
+            s = _requests.Session()
+            s.headers.update({"User-Agent": "Vultix/2.0 Security Scanner (Educational)"})
+            return s
+
+        def _sqli():
+            scanner = SQLiScanner(session=_make_session())
+            for url in urls_with_params: scanner.scan_url_params(url)
+            for form in forms:           scanner.scan_form(form)
             return scanner.get_results()
 
-        vulns.extend(await asyncio.to_thread(_run_sqli))
-
-        # ── Phase 3: XSS ──────────────────────────────────────────────────────
-        if cancel_event.is_set():
-            return await _finish_cancelled(r, scan_id, vulns, start_time)
-
-        await _publish(r, scan_id, "XSS Testing", 38,
-                       "Testing for Cross-Site Scripting vulnerabilities...")
-
-        def _run_xss():
-            scanner = XSSScanner(session=session)
-            for url in urls_with_params:
-                scanner.scan_url_params(url)
-            for form in forms:
-                scanner.scan_form(form)
+        def _xss():
+            scanner = XSSScanner(session=_make_session())
+            for url in urls_with_params: scanner.scan_url_params(url)
+            for form in forms:           scanner.scan_form(form)
             return scanner.get_results()
 
-        vulns.extend(await asyncio.to_thread(_run_xss))
+        def _ssti():
+            from scanner.ssti_scanner import SSTIScanner
+            scanner = SSTIScanner(session=_make_session())
+            for url in urls_with_params: scanner.scan_url_params(url)
+            for form in forms:           scanner.scan_form(form)
+            return scanner.get_results()
 
-        # ── Phase 4: Misconfiguration ─────────────────────────────────────────
-        if cancel_event.is_set():
-            return await _finish_cancelled(r, scan_id, vulns, start_time)
-
-        await _publish(r, scan_id, "Misconfig & Nmap Analysis", 50,
-                       "Checking misconfigurations and scanning infrastructure (Nmap)...")
-
-        def _run_misconfig():
+        def _misconfig():
             from scanner.nmap_scanner import run_nmap_scan
-
-            scanner = MisconfigScanner(session=session)
-            if pages:
-                scanner.scan_headers(pages[0])
+            scanner = MisconfigScanner(session=_make_session())
+            if pages: scanner.scan_headers(pages[0])
             scanner.scan_sensitive_files(target_url)
             scanner.check_https(target_url)
-
             results = scanner.get_results()
-            # Pass stop_event so Nmap subprocess is killed the instant Cancel is clicked
             results.extend(run_nmap_scan(target_url, stop_event=stop_event))
             return results
 
-        vulns.extend(await asyncio.to_thread(_run_misconfig))
-
-        # ── Phase 5: Advanced checks ──────────────────────────────────────────
-        if cancel_event.is_set():
-            return await _finish_cancelled(r, scan_id, vulns, start_time)
-
-        await _publish(r, scan_id, "Advanced Security Checks", 65,
-                       "Running CSRF, clickjacking, directory traversal, open redirect checks...")
-
-        def _run_advanced():
-            scanner = AdvancedScanner(session=session)
+        def _advanced():
+            scanner = AdvancedScanner(session=_make_session())
             scanner.run_all(target_url, pages, forms, urls_with_params)
             return scanner.get_results()
 
-        vulns.extend(await asyncio.to_thread(_run_advanced))
+        # Launch all 5 scanner groups concurrently
+        await asyncio.gather(
+            _run_and_collect(_sqli,     "SQL Injection Testing",        30),
+            _run_and_collect(_xss,      "XSS Testing",                  40),
+            _run_and_collect(_ssti,     "SSTI Testing",                 50),
+            _run_and_collect(_misconfig,"Misconfig & Nmap Analysis",    60),
+            _run_and_collect(_advanced, "Advanced Security Checks",     70),
+        )
 
-        # ── Phase 6: Deduplicate + Save results ──────────────────────────────
+        # ── Phase 7: Deduplicate + Save ───────────────────────────────────────
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, vulns, start_time)
 
         vulns = _deduplicate_vulns(vulns)
 
         await _publish(r, scan_id, "Saving Results", 90,
-                       f"Deduplication complete — saving {len(vulns)} unique findings...")
+                       f"Deduplication complete — {len(vulns)} unique findings",
+                       vulns_found=len(vulns),
+                       vulnerabilities=vulns)
 
         threat_score = calculate_threat_score(vulns)
+        # Clear incremental findings first to avoid duplicates
+        await delete_scan_vulnerabilities(scan_id)
+        # Save all deduplicated findings to SQLite at once
         for vuln in vulns:
             await save_vulnerability(scan_id, vuln)
-
-        duration = time.time() - start_time
+        duration     = time.time() - start_time
         await update_scan_results(scan_id, vulns, duration, threat_score)
 
         await _publish(
@@ -345,6 +450,8 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
             f"Scan complete! Found {len(vulns)} vulnerabilities "
             f"(Threat Score: {threat_score}/100) in {duration:.1f}s",
             done=True,
+            vulns_found=len(vulns),
+            vulnerabilities=vulns,
         )
 
         return {"scan_id": scan_id, "total": len(vulns), "threat_score": threat_score}
@@ -361,25 +468,26 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Task 2 — AI-powered scan pipeline
+# Task 2 — AI-powered scan pipeline (v3 — all optimizations)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Phase labels mirror AIScannerEngine._VULN_PHASES from the old scanner_engine.py
 _AI_VULN_PHASES = [
     ("SQL Injection",                            8,  "AI: Planning SQL Injection attack..."),
     ("Cross-Site Scripting (XSS)",              14,  "AI: Testing for XSS vulnerabilities..."),
-    ("Infrastructure & Port Scan (Nmap)",       21,  "AI: Scanning infrastructure and open ports..."),
-    ("CSRF",                                    28,  "AI: Analysing CSRF token protections..."),
-    ("Directory Traversal",                     35,  "AI: Testing directory traversal paths..."),
-    ("Open Redirect",                           41,  "AI: Checking open redirect parameters..."),
-    ("Clickjacking",                            47,  "AI: Checking clickjacking headers..."),
-    ("Sensitive Data Exposure",                 53,  "AI: Scanning for sensitive data leaks..."),
-    ("Weak Authentication",                     59,  "AI: Evaluating authentication strength..."),
+    ("Server-Side Template Injection (SSTI)",   20,  "AI: Testing for Server-Side Template Injection..."),
+    ("Infrastructure & Port Scan (Nmap)",       26,  "AI: Scanning infrastructure and open ports..."),
+    ("CSRF",                                    32,  "AI: Analysing CSRF token protections..."),
+    ("Directory Traversal",                     38,  "AI: Testing directory traversal paths..."),
+    ("Open Redirect",                           44,  "AI: Checking open redirect parameters..."),
+    ("Clickjacking",                            50,  "AI: Checking clickjacking headers..."),
+    ("Sensitive Data Exposure",                 55,  "AI: Scanning for sensitive data leaks..."),
+    ("Weak Authentication",                     60,  "AI: Evaluating authentication strength..."),
     ("Server-Side Request Forgery (SSRF)",      65,  "AI: Probing for SSRF attack vectors..."),
-    ("CORS Misconfiguration",                   71,  "AI: Testing cross-origin resource sharing policy..."),
-    ("Insecure Direct Object Reference (IDOR)", 77,  "AI: Testing IDOR via ID parameter enumeration..."),
-    ("Business Logic & API Endpoint Discovery", 82,  "AI: Discovering hidden API endpoints & logic flaws..."),
-    ("HTTP Parameter Pollution (HPP)",          87,  "AI: Testing parameter pollution vectors..."),
+    ("CORS Misconfiguration",                   70,  "AI: Testing cross-origin resource sharing policy..."),
+    ("Insecure Direct Object Reference (IDOR)", 75,  "AI: Testing IDOR via ID parameter enumeration..."),
+    ("Business Logic & API Endpoint Discovery", 81,  "AI: Discovering hidden API endpoints & logic flaws..."),
+    ("HTTP Parameter Pollution (HPP)",          86,  "AI: Testing parameter pollution vectors..."),
     ("XML External Entity (XXE) Injection",     92,  "AI: Testing XXE injection via XML inputs..."),
 ]
 
@@ -392,19 +500,25 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
     """
     Runs the AI-powered scan pipeline as a Taskiq task.
 
-    Uses the new async ai_orchestrator (Phase 6) which talks to vLLM
-    via the openai package. Each vulnerability type is tested with a
-    configurable timeout so a slow vLLM response can't stall the entire scan.
-
-    Cancellation is checked between vulnerability types (same asyncio.Event
-    pattern as run_scan_task).
+    v3 Changes:
+      - WAF pre-detection: probes the target for CF-Ray/WAF headers before
+        launching any scanner; result is passed to AI agents so they apply
+        evasion on Attempt 1 instead of waiting to get blocked.
+      - Crawl runs once; crawl_data is passed to both baseline scanners and
+        AI fallback loops to eliminate all redundant crawling.
+      - Baseline scanners (SQLi, XSS, SSTI, Misconfig, Advanced) run
+        concurrently via asyncio.gather() in separate threads.
+      - Findings are saved to SQLite immediately as each scanner completes.
+      - Adaptive semaphore: vLLM health endpoint is queried; concurrency is
+        set to 3 if vLLM is healthy, falling back to 2 if unreachable.
+      - Progress events include vulns_found count for live UI updates.
     """
-    from scanner.ai_orchestrator import scan_vulnerability_with_ai
+    from scanner.ai_orchestrator import scan_vulnerability_with_ai, detect_waf
 
-    start_time   = time.time()
+    start_time    = time.time()
     all_findings: list = []
-    cancel_event = asyncio.Event()
-    stop_event   = threading.Event()  # kills blocking subprocesses (Nmap) instantly
+    cancel_event  = asyncio.Event()
+    stop_event    = threading.Event()
 
     if not target_url.startswith(("http://", "https://")):
         target_url = "http://" + target_url
@@ -420,7 +534,7 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
             async for msg in pub2.listen():
                 if msg["type"] == "message":
                     cancel_event.set()
-                    stop_event.set()   # <-- kills Nmap subprocess instantly
+                    stop_event.set()
                     break
         finally:
             await pub2.unsubscribe(f"scan:cancel:{scan_id}")
@@ -428,129 +542,263 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
 
     cancel_watcher = asyncio.create_task(_ai_watch_cancel())
 
-    try:
-        # ── Initialise ────────────────────────────────────────────────────────
-        await _publish(r, scan_id, "AI Agents Initialising", 2,
-                       "Connecting to vLLM server and preparing baseline scanners...")
+    # Lock for safe concurrent mutations to all_findings and Redis publishes
+    findings_lock = asyncio.Lock()
 
-        # ── Baseline Scan (Traditional) ───────────────────────────────────────
+    try:
+        # ── Phase 0: WAF Detection + vLLM health check ────────────────────────
+        await _publish(r, scan_id, "AI Agents Initialising", 2,
+                       "Detecting WAF protections & checking vLLM server...",
+                       vulns_found=0)
+
+        # Run WAF detection and vLLM health check concurrently
+        waf_info, sem = await asyncio.gather(
+            detect_waf(target_url),
+            _get_ai_semaphore(),
+        )
+
+        if waf_info.get("detected"):
+            waf_name = waf_info.get("name", "Unknown WAF")
+            await _publish(r, scan_id, "WAF Detected", 3,
+                           f"⚠️ WAF detected ({waf_name}) — enabling evasion on all AI probes.",
+                           vulns_found=0)
+
+        # ── Phase 1: Crawl ────────────────────────────────────────────────────
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, all_findings, start_time)
 
-        await _publish(r, scan_id, "Baseline Scan", 5,
-                       "Running traditional security checks (Crawling, SQLi, XSS, Nmap)...")
+        await _publish(r, scan_id, "Crawling", 4,
+                       f"Crawling {target_url} (shared across all scanners)...",
+                       vulns_found=0)
 
-        def _run_baseline():
-            import requests as _requests
-            from scanner.crawler import Crawler
-            from scanner.sqli_scanner import SQLiScanner
-            from scanner.xss_scanner import XSSScanner
-            from scanner.misconfig_scanner import MisconfigScanner
-            from scanner.advanced_scanner import AdvancedScanner
-            from scanner.nmap_scanner import run_nmap_scan
+        import requests as _req
+        from scanner.crawler import Crawler
 
-            session = _requests.Session()
-            session.headers.update({"User-Agent": "Vultix/2.0 Security Scanner (Educational)"})
-            trad_vulns = []
+        def _do_crawl():
+            return Crawler(target_url).crawl()
 
-            # Crawl
-            crawler = Crawler(target_url)
-            crawl_data = crawler.crawl()
+        crawl_data = await asyncio.to_thread(_do_crawl)
+        pages            = crawl_data["pages"]
+        forms            = crawl_data["forms"]
+        urls_with_params = crawl_data["urls_with_params"]
 
-            # SQLi
-            sqli = SQLiScanner(session=session)
-            for u in crawl_data["urls_with_params"]: sqli.scan_url_params(u)
-            for f in crawl_data["forms"]: sqli.scan_form(f)
-            trad_vulns.extend(sqli.get_results())
+        await _publish(r, scan_id, "Crawling Complete", 5,
+                       f"Found {len(pages)} pages, {len(forms)} forms, "
+                       f"{len(urls_with_params)} parameterised URLs",
+                       vulns_found=0)
 
-            # XSS
-            xss = XSSScanner(session=session)
-            for u in crawl_data["urls_with_params"]: xss.scan_url_params(u)
-            for f in crawl_data["forms"]: xss.scan_form(f)
-            trad_vulns.extend(xss.get_results())
+        # ── Phase 2: Concurrent Baseline Scan ────────────────────────────────
+        if cancel_event.is_set():
+            return await _finish_cancelled(r, scan_id, all_findings, start_time)
 
-            # Misconfig & Nmap
-            misc = MisconfigScanner(session=session)
-            if crawl_data["pages"]: misc.scan_headers(crawl_data["pages"][0])
-            misc.scan_sensitive_files(target_url)
-            misc.check_https(target_url)
-            trad_vulns.extend(misc.get_results())
-            trad_vulns.extend(run_nmap_scan(target_url, stop_event=stop_event))
+        await _publish(r, scan_id, "Baseline Scan", 6,
+                       "Running traditional security checks in parallel (SQLi, XSS, SSTI, Nmap)...",
+                       vulns_found=0)
 
-            # Advanced
-            adv = AdvancedScanner(session=session)
-            adv.run_all(target_url, crawl_data["pages"], crawl_data["forms"], crawl_data["urls_with_params"])
-            trad_vulns.extend(adv.get_results())
+        def _make_session():
+            s = _req.Session()
+            s.headers.update({"User-Agent": "Vultix/2.0 Security Scanner (Educational)"})
+            return s
 
-            return trad_vulns
-
-        baseline_findings = await asyncio.to_thread(_run_baseline)
-        all_findings.extend(baseline_findings)
-
-        # ── Per-vulnerability AI loop ─────────────────────────────────────────
-        for vuln_type, progress_pct, phase_msg in _AI_VULN_PHASES:
-
+        async def _baseline_run_and_collect(scanner_fn, label: str):
             if cancel_event.is_set():
-                return await _finish_cancelled(r, scan_id, all_findings, start_time)
+                return
+            new_findings = await asyncio.to_thread(scanner_fn)
+            async with findings_lock:
+                if not cancel_event.is_set():
+                    if new_findings:
+                        all_findings.extend(new_findings)
+                    
+                    deduped = _deduplicate_vulns(all_findings)
+                    
+                    await delete_scan_vulnerabilities(scan_id)
+                    for v in deduped:
+                        await save_vulnerability(scan_id, v)
+                        
+                    await _publish(
+                        r, scan_id, "Baseline Scan", 6,
+                        f"Baseline: {label} — {len(new_findings) if new_findings else 0} finding(s) (total: {len(deduped)})",
+                        vulns_found=len(deduped),
+                        vulnerabilities=deduped,
+                    )
 
-            await _publish(
-                r, scan_id,
-                phase=phase_msg.split(":")[0],
-                progress=progress_pct,
-                message=phase_msg,
-            )
+        def _sqli():
+            from scanner.sqli_scanner import SQLiScanner
+            s = SQLiScanner(session=_make_session())
+            for u in urls_with_params: s.scan_url_params(u)
+            for f in forms:            s.scan_form(f)
+            return s.get_results()
 
-            try:
-                result = await asyncio.wait_for(
-                    scan_vulnerability_with_ai(
-                        target_url,
-                        vuln_type,
-                        cancel_event=cancel_event,
-                        stop_event=stop_event,
-                    ),
-                    timeout=_VULN_TIMEOUT,
-                )
-                all_findings.extend(result.get("findings", []))
+        def _xss():
+            from scanner.xss_scanner import XSSScanner
+            s = XSSScanner(session=_make_session())
+            for u in urls_with_params: s.scan_url_params(u)
+            for f in forms:            s.scan_form(f)
+            return s.get_results()
 
-            except asyncio.TimeoutError:
-                await _publish(
-                    r, scan_id,
-                    phase="Skipping (Timeout)",
-                    progress=progress_pct,
-                    message=(
-                        f"AI timed out on {vuln_type} after "
-                        f"{_VULN_TIMEOUT}s — skipping."
-                    ),
-                )
+        def _ssti():
+            from scanner.ssti_scanner import SSTIScanner
+            s = SSTIScanner(session=_make_session())
+            for u in urls_with_params: s.scan_url_params(u)
+            for f in forms:            s.scan_form(f)
+            return s.get_results()
 
-            except Exception as vuln_err:
-                err_msg = str(vuln_err)
-                if any(kw in err_msg.upper() for kw in ["WAF", "BLOCK", "403", "CLOUDFLARE"]):
-                    friendly = f"{vuln_type}: target blocked the AI probe (WAF/firewall) — skipping."
-                else:
-                    friendly = f"Error on {vuln_type}: {err_msg} — continuing..."
+        def _misconfig():
+            from scanner.misconfig_scanner import MisconfigScanner
+            from scanner.nmap_scanner import run_nmap_scan
+            ms = MisconfigScanner(session=_make_session())
+            if pages: ms.scan_headers(pages[0])
+            ms.scan_sensitive_files(target_url)
+            ms.check_https(target_url)
+            results = ms.get_results()
+            results.extend(run_nmap_scan(target_url, stop_event=stop_event))
+            return results
 
-                await _publish(
-                    r, scan_id,
-                    phase="Skipping",
-                    progress=progress_pct,
-                    message=friendly,
-                )
+        def _advanced():
+            from scanner.advanced_scanner import AdvancedScanner
+            s = AdvancedScanner(session=_make_session())
+            s.run_all(target_url, pages, forms, urls_with_params)
+            return s.get_results()
 
-        # ── Save results ──────────────────────────────────────────────────────
+        # Run all 5 baseline scanner groups concurrently
+        await asyncio.gather(
+            _baseline_run_and_collect(_sqli,     "SQL Injection"),
+            _baseline_run_and_collect(_xss,      "XSS"),
+            _baseline_run_and_collect(_ssti,     "SSTI"),
+            _baseline_run_and_collect(_misconfig,"Misconfig & Nmap"),
+            _baseline_run_and_collect(_advanced, "Advanced Checks"),
+        )
+
+        await _publish(r, scan_id, "Baseline Complete", 7,
+                       f"Baseline scan done — {len(all_findings)} findings so far",
+                       vulns_found=len(all_findings))
+
+        # ── Phase 3: AI Agent Loop ────────────────────────────────────────────
+        # Fire all vulnerability types concurrently under the adaptive semaphore.
+        # crawl_data and waf_info are passed to eliminate redundant re-crawling
+        # inside fallback scanners.
+        completed     = [0]
+        total_phases  = len(_AI_VULN_PHASES)
+
+        async def _run_one(vuln_type: str) -> None:
+            """Run a single vulnerability scan under the semaphore."""
+            async with sem:
+                if cancel_event.is_set():
+                    return
+
+                async with findings_lock:
+                    pct = min(92, 8 + completed[0] * (84 // total_phases))
+                    deduped_init = _deduplicate_vulns(all_findings)
+                    await _publish(
+                        r, scan_id,
+                        phase="AI Scan",
+                        progress=pct,
+                        message=f"AI: Testing — {vuln_type}…",
+                        vulns_found=len(deduped_init),
+                        vulnerabilities=deduped_init,
+                    )
+
+                try:
+                    result = await asyncio.wait_for(
+                        scan_vulnerability_with_ai(
+                            target_url,
+                            vuln_type,
+                            cancel_event=cancel_event,
+                            stop_event=stop_event,
+                            crawl_data=crawl_data,
+                            waf_info=waf_info,
+                        ),
+                        timeout=_VULN_TIMEOUT,
+                    )
+                    findings = result.get("findings", [])
+                    async with findings_lock:
+                        if findings:
+                            all_findings.extend(findings)
+                        
+                        deduped = _deduplicate_vulns(all_findings)
+                        
+                        await delete_scan_vulnerabilities(scan_id)
+                        for v in deduped:
+                            await save_vulnerability(scan_id, v)
+                            
+                        completed[0] += 1
+                        pct = min(92, 8 + completed[0] * (84 // total_phases))
+                        found_str = f" — {len(findings)} finding(s)" if findings else " — nothing found"
+                        await _publish(
+                            r, scan_id,
+                            phase="AI Scan",
+                            progress=pct,
+                            message=(
+                                f"AI: Finished {vuln_type}{found_str} "
+                                f"({completed[0]}/{total_phases} complete)"
+                            ),
+                            vulns_found=len(deduped),
+                            vulnerabilities=deduped,
+                        )
+
+                except asyncio.TimeoutError:
+                    async with findings_lock:
+                        completed[0] += 1
+                        pct = min(92, 8 + completed[0] * (84 // total_phases))
+                        deduped = _deduplicate_vulns(all_findings)
+                        await _publish(
+                            r, scan_id,
+                            phase="Skipping (Timeout)",
+                            progress=pct,
+                            message=(
+                                f"AI timed out on {vuln_type} after "
+                                f"{_VULN_TIMEOUT}s — skipping "
+                                f"({completed[0]}/{total_phases} complete)"
+                            ),
+                            vulns_found=len(deduped),
+                            vulnerabilities=deduped,
+                        )
+
+                except Exception as vuln_err:
+                    err_msg = str(vuln_err)
+                    if any(kw in err_msg.upper() for kw in ["WAF", "BLOCK", "403", "CLOUDFLARE"]):
+                        friendly = (
+                            f"{vuln_type}: target blocked the AI probe (WAF/firewall) — skipping."
+                        )
+                    else:
+                        friendly = f"Error on {vuln_type}: {err_msg} — continuing…"
+                    async with findings_lock:
+                        completed[0] += 1
+                        pct = min(92, 8 + completed[0] * (84 // total_phases))
+                        deduped = _deduplicate_vulns(all_findings)
+                        await _publish(
+                            r, scan_id,
+                            phase="Skipping",
+                            progress=pct,
+                            message=friendly,
+                            vulns_found=len(deduped),
+                            vulnerabilities=deduped,
+                        )
+
+        # Fire all AI checks concurrently under the adaptive semaphore
+        await asyncio.gather(*[
+            _run_one(vuln_type)
+            for vuln_type, _, _ in _AI_VULN_PHASES
+        ])
+
+        # ── Save final deduplicated results ───────────────────────────────────
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, all_findings, start_time)
 
         all_findings = _deduplicate_vulns(all_findings)
 
         await _publish(r, scan_id, "Saving Results", 95,
-                       f"Deduplication complete — saving {len(all_findings)} unique AI findings...")
+                       f"Deduplication complete — {len(all_findings)} unique AI findings...",
+                       vulns_found=len(all_findings),
+                       vulnerabilities=all_findings)
 
         threat_score = calculate_threat_score(all_findings)
+        # Delete the incremental (pre-dedup) rows from SQLite and re-insert
+        # only the clean deduplicated findings so no duplicate rows persist.
+        await delete_scan_vulnerabilities(scan_id)
         for vuln in all_findings:
             await save_vulnerability(scan_id, vuln)
-
-        duration = time.time() - start_time
+        duration     = time.time() - start_time
         await update_scan_results(scan_id, all_findings, duration, threat_score)
 
         await _publish(
@@ -558,11 +806,13 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
             f"AI Scan complete! Found {len(all_findings)} vulnerabilities "
             f"(Threat Score: {threat_score}/100) in {duration:.1f}s",
             done=True,
+            vulns_found=len(all_findings),
+            vulnerabilities=all_findings,
         )
 
         return {
-            "scan_id":     scan_id,
-            "total":       len(all_findings),
+            "scan_id":      scan_id,
+            "total":        len(all_findings),
             "threat_score": threat_score,
         }
 

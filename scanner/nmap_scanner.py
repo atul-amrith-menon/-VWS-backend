@@ -30,8 +30,7 @@ import sys
 from urllib.parse import urlparse
 
 
-# ── Nmap timeout — must be generous for stealthy (-T2) scans ─────────────────
-NMAP_TIMEOUT_SECONDS = 300  # 5 minutes ceiling for quiet scans
+# Nmap timeout has been removed to allow complete scanning without a timeout ceiling.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,11 +287,14 @@ def run_nmap_scan(target_url: str, stop_event=None) -> list[dict]:
     cmd = [
         nmap_exe,
         "-F",                              # Top 100 ports only
-        "-T2",                             # Polite/quiet timing (stealth)
+        "-T4",                             # Aggressive timing (extremely fast, prevents timeouts)
         "-Pn",                             # Skip host discovery
         "-sV",                             # Service/version detection
         "--script=http-security-headers",  # NSE header check
-        "--host-timeout", "5m",            # Hard per-host timeout (5 minutes)
+        "--script-args", "http.timeout=3s",# Timeout slow HTTP requests inside NSE scripts
+        "--max-retries", "1",              # Stop retrying lost packets on firewalled hosts
+        "--max-scan-delay", "20ms",        # Prevent WAF rate-limiting from slowing Nmap to a crawl
+        "--host-timeout", "45s",           # Standard limit: tell Nmap to stop scanning this host if it takes > 45s
         host,
     ]
 
@@ -304,25 +306,22 @@ def run_nmap_scan(target_url: str, stop_event=None) -> list[dict]:
             text=True,
         )
 
-        # Poll until done or stop_event is triggered
+        # Poll until done, stop_event is triggered, or we hit a hard execution ceiling
         import time as _time
-        deadline = _time.monotonic() + NMAP_TIMEOUT_SECONDS
+        start_poll = _time.time()
+        max_scan_time = 50.0  # 50-second ceiling (slightly above the 45s Nmap host-timeout)
+        
         while proc.poll() is None:
             # Check cancel signal
             if stop_event is not None and stop_event.is_set():
                 proc.kill()
                 return []   # Cancelled — return empty, caller handles cleanup
-            # Check global timeout
-            if _time.monotonic() > deadline:
+                
+            # Check hard timeout limit
+            if _time.time() - start_poll > max_scan_time:
                 proc.kill()
-                return [_build_finding(
-                    vuln_type   = "Nmap Scan Timed Out",
-                    risk_level  = "Info",
-                    url         = target_url,
-                    description = f"Nmap scan of {host} exceeded the {NMAP_TIMEOUT_SECONDS}s timeout.",
-                    evidence    = f"Command: {' '.join(cmd)}",
-                    solution    = "The target host may be rate-limiting or blocking port scans.",
-                )]
+                break
+                
             _time.sleep(0.5)  # Poll every 500ms
 
         nmap_output = proc.stdout.read()

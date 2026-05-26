@@ -205,6 +205,12 @@ async def scan_stream(
             # and fire onerror prematurely.
             yield {"data": json.dumps({"phase": "Connected", "progress": 0, "message": "Stream connected", "heartbeat": True})}
 
+            # Retrieve any cached progress payload from Redis so that page navigations
+            # do not reset the visible progress percentage to 0%.
+            cached_progress = await r.get(f"scan:progress:{scan_id}")
+            if cached_progress:
+                yield {"data": cached_progress}
+
             # Before streaming live events, check if the scan already finished.
             # This handles the case where the client reconnects after a brief
             # disconnect and the scan completed in the interim.
@@ -258,9 +264,9 @@ async def get_scan_detail(
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
-    vulns = []
-    if scan["status"] in ("completed", "error", "cancelled"):
-        vulns = await get_vulnerabilities(scan_id)
+    # Return vulnerabilities even for running scans so the frontend can
+    # display findings in real-time as they are saved by the background worker.
+    vulns = await get_vulnerabilities(scan_id)
 
     return {"scan": scan, "vulnerabilities": vulns}
 
