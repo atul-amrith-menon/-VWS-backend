@@ -32,10 +32,42 @@ class SSTIScanner:
     while a vulnerable template engine will evaluate and return '49'.
     """
 
-    def __init__(self, session=None, timeout=10):
+    def __init__(self, session=None, timeout=10, tech_context: list[str] = None):
         self.session = session or requests.Session()
         self.timeout = timeout
         self.vulnerabilities = []
+        self.tech_context = tech_context or []
+        
+        # Prioritize payloads based on the technology context if provided
+        self.payloads = list(SSTI_PAYLOADS)
+        if self.tech_context:
+            tech_lower = [t.lower() for t in self.tech_context]
+            
+            # Map technologies to preferred payload prefixes/formats
+            preferred = []
+            
+            # Python/Flask/Jinja2/Django
+            if any(k in tech_lower for k in ["python", "werkzeug", "gunicorn", "flask", "django"]):
+                preferred.append("{{7*7}}")
+                
+            # Java/Spring/Thymeleaf/FreeMarker
+            if any(k in tech_lower for k in ["spring", "java", "thymeleaf", "freemarker", "velocity"]):
+                preferred.append("*{7*7}")
+                preferred.append("${7*7}")
+                
+            # Ruby/Rails/ERB
+            if any(k in tech_lower for k in ["ruby", "rails", "erb"]):
+                preferred.append("<%= 7*7 %>")
+                
+            # Node.js/Express/EJS
+            if any(k in tech_lower for k in ["node", "express", "ejs"]):
+                preferred.append("<%= 7*7 %>")
+                
+            # Reorder self.payloads to put preferred payloads first
+            if preferred:
+                matched = [p for p in self.payloads if p[0] in preferred]
+                unmatched = [p for p in self.payloads if p[0] not in preferred]
+                self.payloads = matched + unmatched
 
     # ================================================================
     # URL Parameter Scanning
@@ -49,7 +81,7 @@ class SSTIScanner:
             return
 
         for param_name in params:
-            for payload, expected in SSTI_PAYLOADS:
+            for payload, expected in self.payloads:
                 try:
                     modified = dict(params)
                     modified[param_name] = [payload]
@@ -70,7 +102,7 @@ class SSTIScanner:
                                 payload=payload,
                                 expected=expected,
                                 context="URL parameter",
-                            )
+                             )
                         )
                         return  # One confirmed finding per URL is sufficient
 
@@ -91,7 +123,7 @@ class SSTIScanner:
             return
 
         for input_field in inputs:
-            for payload, expected in SSTI_PAYLOADS:
+            for payload, expected in self.payloads:
                 try:
                     # Build form data: inject payload only into the current field
                     data = {}

@@ -276,7 +276,7 @@ async def _chat_async(adapter_id: str, system: str, messages: list) -> str:
             model=adapter_id,
             messages=[{"role": "system", "content": system}, *messages],
             temperature=0.1,
-            max_tokens=1024,   # Scripts/reviews rarely exceed 700 tokens; prevents runaway generation on local 8B model
+            max_tokens=2048,   # Prevent mid-sentence truncation of long security analysis reports while still capping runaway generations
         ),
         timeout=AI_CALL_TIMEOUT,
     )
@@ -307,9 +307,11 @@ def _clean_executor_output(raw: str) -> str:
 
     Rules:
       • Errors and STDERR pass through untouched (the Analyst needs full context).
-      • Non-HTML outputs pass through untouched (JSON, plain-text, headers, etc.).
-      • HTML outputs are parsed, noisy tags are decomposed, and clean text is
-        truncated to 1 200 characters — comfortably within a 3 072-token context.
+      • Non-HTML outputs are hard-truncated to 500 chars (JSON/plain-text seldom
+        need more than a status code + key field to confirm a finding).
+      • HTML outputs are parsed, all noisy layout/navigation tags are removed,
+        and clean semantic text is truncated to 800 chars — roughly 200 tokens,
+        comfortably within a 3 072-token context window on a 6 GB RTX 4050.
     """
     # Always preserve error payloads in full so the Analyst can diagnose them.
     if "[STDERR]" in raw or "EXECUTOR_ERROR" in raw:
@@ -318,31 +320,39 @@ def _clean_executor_output(raw: str) -> str:
     # Only apply HTML parsing when the output actually contains HTML markup.
     html_indicators = ("<html", "<body", "<div", "<span", "<p>", "<!doctype")
     if not any(indicator in raw.lower() for indicator in html_indicators):
-        return raw  # Plain-text / JSON / header output — return as-is.
+        # Plain-text / JSON / header output — truncate aggressively.
+        # Status lines, headers and JSON keys are almost always < 500 chars.
+        return raw[:500] if len(raw) > 500 else raw
 
     try:
         soup = BeautifulSoup(raw, "html.parser")
 
         # Remove noisy, non-semantic tags that waste VRAM and confuse the model.
+        # Extended list: nav/header/footer/aside add zero vulnerability signal.
         for tag in soup(["style", "script", "svg", "path", "link", "iframe",
-                         "noscript", "meta", "head"]):
+                         "noscript", "meta", "head", "nav", "header",
+                         "footer", "aside", "figure", "picture"]):
             tag.decompose()
 
         # Extract clean, readable text from the remaining DOM.
         clean_text = soup.get_text(separator="\n")
 
-        # Collapse multiple consecutive blank lines into a single line break.
+        # Collapse whitespace aggressively: multiple spaces → one, multiple
+        # blank lines → one. This alone often cuts output length by 30 %.
+        clean_text = re.sub(r" {2,}", " ", clean_text)
         clean_text = re.sub(r"\n{2,}", "\n", clean_text).strip()
 
-        # Truncate to a VRAM-safe length for the 6GB RTX 4050.
-        if len(clean_text) > 1200:
-            clean_text = clean_text[:1200]
+        # Hard-truncate to 800 chars (≈ 200 tokens) — VRAM-safe for RTX 4050.
+        # Reduced from 1 200: the first 800 chars always contain the page title,
+        # error message, and primary content block — the Analyst needs no more.
+        if len(clean_text) > 800:
+            clean_text = clean_text[:800]
 
         return f"[CLEANED HTML CONTENT (VRAM Safe)]\n{clean_text}"
 
     except Exception:
         # Parser failure — fall back to simple truncation so the scan never crashes.
-        return raw[:1000]
+        return raw[:500]
 
 
 def _run_python_code(code: str, timeout: int = 25) -> str:

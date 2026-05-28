@@ -1,24 +1,27 @@
-import sqlite3
+import sys
 import os
+import asyncio
 
-db_path = os.path.join(os.path.dirname(__file__), 'vultix.db')
-if not os.path.exists(db_path):
-    print("Database not found.")
-else:
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Enable foreign keys so CASCADE works
-        cursor.execute("PRAGMA foreign_keys = ON")
-        
-        # Delete all users (which will also delete their refresh tokens via CASCADE)
-        cursor.execute("DELETE FROM users")
-        conn.commit()
-        
-        print("Successfully deleted all user accounts and active login sessions!")
-        
-    except Exception as e:
-        print(f"Error clearing database: {e}")
-    finally:
-        conn.close()
+# Add project root to python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from sqlmodel import select
+from sqlalchemy import delete
+from models.auth_db import AsyncSessionLocal, User, RefreshToken
+
+async def clear_users():
+    async with AsyncSessionLocal() as session:
+        try:
+            # Delete all refresh tokens first (or MySQL does it via FK checks)
+            await session.execute(delete(RefreshToken))
+            # Delete all users
+            await session.execute(delete(User))
+            await session.commit()
+            
+            print("Successfully deleted all MySQL user accounts and active login sessions!")
+            
+        except Exception as e:
+            print(f"Error clearing MySQL database: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(clear_users())

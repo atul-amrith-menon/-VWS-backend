@@ -1,34 +1,19 @@
 """
-models/scan_db.py — Async Scan & Vulnerability Database Layer
-==============================================================
-Drop-in async replacement for the old synchronous models/database.py.
-
-All functions are `async def` using `aiosqlite` so they never block
-the FastAPI event loop. The SQLite schema is identical to the original
-so the existing `vultix.db` file works without any migration.
-
-Public API (mirrors old database.py):
-    init_db()
-    create_scan(target_url, user_id)         -> int
-    save_vulnerability(scan_id, vuln)
-    update_scan_results(scan_id, vulns, duration, threat_score)
-    update_scan_status(scan_id, status)
-    get_scan(scan_id, user_id)               -> dict | None
-    get_vulnerabilities(scan_id)             -> list[dict]
-    get_all_scans(user_id)                   -> list[dict]
-    delete_scan(scan_id, user_id)
+models/scan_db.py — Async Scan & Vulnerability Database Layer (SQLModel + MySQL)
+==============================================================================
+Consolidated database layer utilizing SQLModel and the centralized MySQL connection pool.
+All functions are asynchronous and maintain 100% backward-compatible schemas and signatures.
 """
 
 import os
-import aiosqlite
 from datetime import datetime
+from typing import Optional, List, Dict, Any
 
-# ── Database path ─────────────────────────────────────────────────────────────
-DB_PATH = os.getenv(
-    "DB_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vultix.db"),
-)
+from sqlmodel import SQLModel, Field, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text, delete, update, Column, Integer, ForeignKey, Text, case
 
+from models.auth_db import AsyncSessionLocal, engine
 
 # ── Risk weights for threat score ─────────────────────────────────────────────
 _RISK_WEIGHTS = {"High": 15, "Medium": 8, "Low": 3, "Info": 1}
@@ -40,114 +25,139 @@ _CRITICAL_TYPES = {
     "Server-Side Template Injection (SSTI)",  # RCE-capable — highest severity
 }
 
+# ── SQLModel Table Definitions ────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Schema initialisation
-# ─────────────────────────────────────────────────────────────────────────────
+class Scan(SQLModel, table=True):
+    __tablename__ = "scans"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(default=0, nullable=False, index=True)
+    target_url: str = Field(nullable=False, max_length=2000)
+    scan_date: str = Field(nullable=False, max_length=50)
+    status: str = Field(default="running", max_length=50)
+    total_vulns: int = Field(default=0)
+    high: int = Field(default=0)
+    medium: int = Field(default=0)
+    low: int = Field(default=0)
+    info: int = Field(default=0)
+    threat_score: int = Field(default=0)
+    duration_seconds: float = Field(default=0.0)
+
+
+class Vulnerability(SQLModel, table=True):
+    __tablename__ = "vulnerabilities"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("scans.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    vuln_type: str = Field(nullable=False, max_length=255)
+    risk_level: str = Field(nullable=False, max_length=50)
+    url: str = Field(nullable=False, max_length=2048)
+    description: str = Field(sa_column=Column(Text, nullable=False))
+    evidence: str = Field(sa_column=Column(Text, nullable=True))
+    solution: str = Field(sa_column=Column(Text, nullable=True))
+
+
+# ── Conversion Helpers ────────────────────────────────────────────────────────
+
+def _scan_to_dict(scan: Scan) -> dict:
+    """Convert a SQLModel Scan object to a dict mirroring raw Row behavior."""
+    return {
+        "id": scan.id,
+        "user_id": scan.user_id,
+        "target_url": scan.target_url,
+        "scan_date": scan.scan_date,
+        "status": scan.status,
+        "total_vulns": scan.total_vulns,
+        "high": scan.high,
+        "medium": scan.medium,
+        "low": scan.low,
+        "info": scan.info,
+        "threat_score": scan.threat_score,
+        "duration_seconds": scan.duration_seconds,
+    }
+
+
+def _vuln_to_dict(vuln: Vulnerability) -> dict:
+    """Convert a SQLModel Vulnerability object to a dict mirroring raw Row behavior."""
+    return {
+        "id": vuln.id,
+        "scan_id": vuln.scan_id,
+        "vuln_type": vuln.vuln_type,
+        "risk_level": vuln.risk_level,
+        "url": vuln.url,
+        "description": vuln.description,
+        "evidence": vuln.evidence or "",
+        "solution": vuln.solution or "",
+    }
+
+
+# ── Schema Initialisation ─────────────────────────────────────────────────────
 
 async def init_db() -> None:
-    """Create tables if they don't exist. Called once at application startup."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS scans (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id          INTEGER NOT NULL DEFAULT 0,
-                target_url       TEXT    NOT NULL,
-                scan_date        TEXT    NOT NULL,
-                status           TEXT    DEFAULT 'running',
-                total_vulns      INTEGER DEFAULT 0,
-                high             INTEGER DEFAULT 0,
-                medium           INTEGER DEFAULT 0,
-                low              INTEGER DEFAULT 0,
-                info             INTEGER DEFAULT 0,
-                threat_score     INTEGER DEFAULT 0,
-                duration_seconds REAL    DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS vulnerabilities (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                scan_id     INTEGER NOT NULL,
-                vuln_type   TEXT    NOT NULL,
-                risk_level  TEXT    NOT NULL,
-                url         TEXT    NOT NULL,
-                description TEXT    NOT NULL,
-                evidence    TEXT    DEFAULT '',
-                solution    TEXT    DEFAULT '',
-                FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
-            )
-        """)
-
-        # ── Safe migration: add user_id to existing databases ─────────────────
-        # This handles the case where the DB already exists without user_id.
-        # SQLite does not support IF NOT EXISTS on ALTER TABLE, so we check the
-        # column list manually and only alter if it's missing.
-        cursor = await db.execute("PRAGMA table_info(scans)")
-        columns = {row[1] for row in await cursor.fetchall()}
-        if "user_id" not in columns:
-            # DEFAULT 0 keeps all existing scan rows intact (they belong to no user).
-            await db.execute(
-                "ALTER TABLE scans ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0"
-            )
-
-        await db.commit()
+    """Create scans and vulnerabilities tables in MySQL if they do not exist."""
+    async with engine.begin() as conn:
+        # Enable foreign keys just in case and create tables
+        await conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+        await conn.run_sync(SQLModel.metadata.create_all)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scan CRUD
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Scan CRUD ─────────────────────────────────────────────────────────────────
 
 async def create_scan(target_url: str, user_id: int) -> int:
     """Insert a new scan record owned by user_id and return its auto-generated ID."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "INSERT INTO scans (user_id, target_url, scan_date, status) VALUES (?, ?, ?, ?)",
-            (user_id, target_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "running"),
+    async with AsyncSessionLocal() as session:
+        new_scan = Scan(
+            user_id=user_id,
+            target_url=target_url,
+            scan_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            status="running",
         )
-        await db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        session.add(new_scan)
+        await session.commit()
+        await session.refresh(new_scan)
+        return new_scan.id  # type: ignore[return-value]
 
 
 async def get_scan(scan_id: int, user_id: int | None = None) -> dict | None:
     """
     Fetch a single scan record by ID.
     If user_id is provided, the scan is only returned if it belongs to that user.
-    Returns None if not found or if it belongs to a different user.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with AsyncSessionLocal() as session:
+        statement = select(Scan).where(Scan.id == scan_id)
         if user_id is not None:
-            cursor = await db.execute(
-                "SELECT * FROM scans WHERE id = ? AND user_id = ?", (scan_id, user_id)
-            )
-        else:
-            # Internal use only (e.g. worker updating status — no user context)
-            cursor = await db.execute("SELECT * FROM scans WHERE id = ?", (scan_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+            statement = statement.where(Scan.user_id == user_id)
+        result = await session.execute(statement)
+        scan = result.scalars().first()
+        return _scan_to_dict(scan) if scan else None
 
 
 async def get_all_scans(user_id: int) -> list[dict]:
     """Return all scan records belonging to user_id, most recent first."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM scans WHERE user_id = ? ORDER BY id DESC", (user_id,)
-        )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+    async with AsyncSessionLocal() as session:
+        statement = select(Scan).where(Scan.user_id == user_id).order_by(Scan.id.desc())
+        result = await session.execute(statement)
+        scans = result.scalars().all()
+        return [_scan_to_dict(s) for s in scans]
 
 
 async def update_scan_status(scan_id: int, status: str) -> None:
-    """Update just the status column of a scan (e.g. 'error', 'cancelled').
-    Called by the background worker — no user_id check needed here."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE scans SET status = ? WHERE id = ?",
-            (status, scan_id),
+    """Update just the status column of a scan (e.g. 'error', 'cancelled')."""
+    async with AsyncSessionLocal() as session:
+        statement = (
+            update(Scan)
+            .where(Scan.id == scan_id)
+            .values(status=status)
         )
-        await db.commit()
+        await session.execute(statement)
+        await session.commit()
 
 
 async def update_scan_results(
@@ -159,102 +169,116 @@ async def update_scan_results(
     """
     Write the final summary row after a scan completes (or is cancelled).
     Counts vulns by severity and marks status as 'completed'.
-    Called by the background worker — no user_id check needed here.
     """
     high   = sum(1 for v in vulns if v.get("risk_level") == "High")
     medium = sum(1 for v in vulns if v.get("risk_level") == "Medium")
     low    = sum(1 for v in vulns if v.get("risk_level") == "Low")
     info   = sum(1 for v in vulns if v.get("risk_level") == "Info")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """UPDATE scans
-               SET status = 'completed', total_vulns = ?, high = ?, medium = ?,
-                   low = ?, info = ?, threat_score = ?, duration_seconds = ?
-               WHERE id = ?""",
-            (len(vulns), high, medium, low, info, threat_score, round(duration, 2), scan_id),
+    async with AsyncSessionLocal() as session:
+        statement = (
+            update(Scan)
+            .where(Scan.id == scan_id)
+            .values(
+                status="completed",
+                total_vulns=len(vulns),
+                high=high,
+                medium=medium,
+                low=low,
+                info=info,
+                threat_score=threat_score,
+                duration_seconds=round(duration, 2),
+            )
         )
-        await db.commit()
+        await session.execute(statement)
+        await session.commit()
 
 
 async def delete_scan(scan_id: int, user_id: int) -> bool:
     """
     Delete a scan and its vulnerabilities only if it belongs to user_id.
-    Returns True if deleted, False if the scan was not found or does not belong
-    to this user (so the API can return 404 appropriately).
+    Leverages database-level ON DELETE CASCADE.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON")
-        cursor = await db.execute(
-            "DELETE FROM scans WHERE id = ? AND user_id = ?", (scan_id, user_id)
-        )
-        await db.commit()
-        return cursor.rowcount > 0  # type: ignore[return-value]
+    async with AsyncSessionLocal() as session:
+        statement = select(Scan).where(Scan.id == scan_id, Scan.user_id == user_id)
+        result = await session.execute(statement)
+        scan = result.scalars().first()
+        if not scan:
+            return False
+        
+        await session.delete(scan)
+        await session.commit()
+        return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Vulnerability CRUD
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Vulnerability CRUD ────────────────────────────────────────────────────────
 
 async def delete_scan_vulnerabilities(scan_id: int) -> None:
     """
     Delete all vulnerability rows for a scan.
-    Called by the AI pipeline to clear incremental saves before re-inserting
-    the final deduplicated set, ensuring no duplicate rows persist.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM vulnerabilities WHERE scan_id = ?", (scan_id,))
-        await db.commit()
+    async with AsyncSessionLocal() as session:
+        statement = delete(Vulnerability).where(Vulnerability.scan_id == scan_id)
+        await session.execute(statement)
+        await session.commit()
+
+
+async def delete_vulnerability_by_key(scan_id: int, vuln_type: str, url: str) -> None:
+    """Delete a single vulnerability row matching scan_id, vuln_type, and url."""
+    async with AsyncSessionLocal() as session:
+        statement = (
+            delete(Vulnerability)
+            .where(
+                Vulnerability.scan_id == scan_id,
+                Vulnerability.vuln_type == vuln_type,
+                Vulnerability.url == url,
+            )
+        )
+        await session.execute(statement)
+        await session.commit()
 
 
 async def save_vulnerability(scan_id: int, vuln: dict) -> None:
     """Insert a single vulnerability record linked to a scan."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO vulnerabilities
-               (scan_id, vuln_type, risk_level, url, description, evidence, solution)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                scan_id,
-                vuln["vuln_type"],
-                vuln["risk_level"],
-                vuln["url"],
-                vuln["description"],
-                vuln.get("evidence", ""),
-                vuln.get("solution", ""),
-            ),
+    async with AsyncSessionLocal() as session:
+        new_vuln = Vulnerability(
+            scan_id=scan_id,
+            vuln_type=vuln["vuln_type"],
+            risk_level=vuln["risk_level"],
+            url=vuln["url"],
+            description=vuln["description"],
+            evidence=vuln.get("evidence", ""),
+            solution=vuln.get("solution", ""),
         )
-        await db.commit()
+        session.add(new_vuln)
+        await session.commit()
 
 
 async def get_vulnerabilities(scan_id: int) -> list[dict]:
     """Return all vulnerabilities for a scan, ordered High → Medium → Low → Info."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT * FROM vulnerabilities
-               WHERE scan_id = ?
-               ORDER BY CASE risk_level
-                   WHEN 'High'   THEN 1
-                   WHEN 'Medium' THEN 2
-                   WHEN 'Low'    THEN 3
-                   ELSE 4
-               END""",
-            (scan_id,),
+    async with AsyncSessionLocal() as session:
+        statement = (
+            select(Vulnerability)
+            .where(Vulnerability.scan_id == scan_id)
+            .order_by(
+                case(
+                    (Vulnerability.risk_level == "High", 1),
+                    (Vulnerability.risk_level == "Medium", 2),
+                    (Vulnerability.risk_level == "Low", 3),
+                    else_=4,
+                )
+            )
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        result = await session.execute(statement)
+        vulns = result.scalars().all()
+        return [_vuln_to_dict(v) for v in vulns]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Threat score helper (moved here so tasks.py can import without circular deps)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Threat score helper ───────────────────────────────────────────────────────
 
 def calculate_threat_score(vulnerabilities: list[dict]) -> int:
     """
     Calculate a 0-100 threat score from a list of vulnerability dicts.
-    Higher = more critical. Kept as a plain (sync) function — it's CPU-only,
-    no I/O, safe to call from async context without to_thread().
     """
     if not vulnerabilities:
         return 0

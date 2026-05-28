@@ -56,6 +56,7 @@ import os
 import threading
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import redis.asyncio as aioredis
 
@@ -63,6 +64,7 @@ from broker import broker
 from models.scan_db import (
     calculate_threat_score,
     delete_scan_vulnerabilities,
+    delete_vulnerability_by_key,
     get_scan,
     save_vulnerability,
     update_scan_results,
@@ -234,6 +236,41 @@ async def _save_new_findings(scan_id: int, new_vulns: list) -> None:
         await save_vulnerability(scan_id, vuln)
 
 
+async def _save_incremental(scan_id: int, deduped_vulns: list, saved_keys: dict) -> None:
+    """
+    Incrementally update SQLite database with new or modified findings.
+    Avoids deleting and re-inserting all findings on every progress update.
+    """
+    current_keys = set()
+    for vuln in deduped_vulns:
+        vuln_type = vuln.get("vuln_type", "")
+        url = vuln.get("url", "")
+        key = (vuln_type.strip().lower(), url.strip().rstrip("/").lower())
+        current_keys.add(key)
+
+        existing = saved_keys.get(key)
+        if existing is None:
+            # New finding! Save it.
+            await save_vulnerability(scan_id, vuln)
+            saved_keys[key] = dict(vuln)
+        else:
+            # Check if evidence, risk level, or description has changed
+            if (existing.get("evidence") != vuln.get("evidence") or 
+                existing.get("risk_level") != vuln.get("risk_level") or 
+                existing.get("description") != vuln.get("description")):
+                # Changed! Delete the old one and insert updated one
+                await delete_vulnerability_by_key(scan_id, vuln_type, url)
+                await save_vulnerability(scan_id, vuln)
+                saved_keys[key] = dict(vuln)
+
+    # Clean up keys that are no longer in deduped
+    for key in list(saved_keys.keys()):
+        if key not in current_keys:
+            vuln_type, url = saved_keys[key]["vuln_type"], saved_keys[key]["url"]
+            await delete_vulnerability_by_key(scan_id, vuln_type, url)
+            del saved_keys[key]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Adaptive AI semaphore helper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -292,6 +329,7 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
     vulns: list  = []
     cancel_event = asyncio.Event()
     stop_event   = threading.Event()
+    saved_keys: dict = {}  # key -> dict of vulnerability details for delta tracking
 
     # Normalise URL
     if not target_url.startswith(("http://", "https://")):
@@ -333,11 +371,29 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
         pages            = crawl_data["pages"]
         forms            = crawl_data["forms"]
         urls_with_params = crawl_data["urls_with_params"]
+        discovered_ports = crawl_data.get("discovered_ports", [])
+
+        # Build alternate port targets so SQLi, XSS, and SSTI scanners test them
+        parsed_target = urlparse(target_url)
+        target_hostname = parsed_target.hostname or target_url
+        
+        for port in discovered_ports:
+            # Construct http:// and https:// URLs for the non-standard port
+            for scheme in ["http", "https"]:
+                alt_url = f"{scheme}://{target_hostname}:{port}/"
+                # Add to pages to ensure other generic checks might pick them up
+                if not any(p["url"] == alt_url for p in pages):
+                    pages.append({
+                        "url": alt_url,
+                        "status_code": 200,
+                        "headers": {},
+                    })
+                # Add to urls_with_params if needed (e.g. as a basic base target) or fuzz targets
 
         await _publish(
             r, scan_id, "Crawling Complete", 18,
             f"Found {len(pages)} pages, {len(forms)} forms, "
-            f"{len(urls_with_params)} parameterised URLs",
+            f"{len(urls_with_params)} parameterised URLs. Discovered non-standard ports: {discovered_ports}",
             vulns_found=0,
         )
 
@@ -348,13 +404,50 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, vulns, start_time)
 
-        await _publish(r, scan_id, "Security Testing", 22,
+        # Pre-emptive Nmap port scan to gather tech signatures for active fuzzers
+        nmap_findings = []
+        tech_signatures = []
+        
+        if not cancel_event.is_set():
+            await _publish(r, scan_id, "Nmap Port Scanning", 20,
+                           f"Running Nmap port scan on ports: {discovered_ports or 'default Fast Mode'}...",
+                           vulns_found=len(_deduplicate_vulns(vulns)))
+            
+            from scanner.nmap_scanner import run_nmap_scan
+            nmap_findings = await asyncio.to_thread(run_nmap_scan, target_url, ports=discovered_ports, stop_event=stop_event)
+            
+            # Parse Nmap findings/output/evidence for technology signatures
+            # E.g. "Werkzeug", "Gunicorn", "Python", "Node", "Ruby", "Spring"
+            known_signatures = ["Werkzeug", "Gunicorn", "Python", "Node", "Ruby", "Spring", "Flask", "Django", "Java", "Express"]
+            for f in nmap_findings:
+                evidence_text = f.get("evidence", "") + " " + f.get("description", "")
+                for sig in known_signatures:
+                    if sig.lower() in evidence_text.lower() and sig not in tech_signatures:
+                        tech_signatures.append(sig)
+            
+            async with findings_lock:
+                if not cancel_event.is_set():
+                    if nmap_findings:
+                        vulns.extend(nmap_findings)
+                    deduped = _deduplicate_vulns(vulns)
+                    await _save_incremental(scan_id, deduped, saved_keys)
+                    await _publish(
+                        r, scan_id, "Nmap Port Scanning", 22,
+                        f"Nmap complete — {len(nmap_findings) if nmap_findings else 0} finding(s). Tech signatures: {tech_signatures}",
+                        vulns_found=len(deduped),
+                        vulnerabilities=deduped,
+                    )
+
+        if cancel_event.is_set():
+            return await _finish_cancelled(r, scan_id, vulns, start_time)
+
+        await _publish(r, scan_id, "Security Testing", 25,
                        "Running SQLi, XSS, SSTI, Misconfig, and Advanced checks in parallel...",
-                       vulns_found=0)
+                       vulns_found=len(_deduplicate_vulns(vulns)))
 
         async def _run_and_collect(scanner_fn, phase_name: str, phase_pct: int):
             """Run a scanner in a thread, then publish its findings count immediately.
-            Saves deduplicated findings to SQLite immediately so they appear in the UI live."""
+            Saves deduplicated findings incrementally to SQLite so they appear in the UI live."""
             if cancel_event.is_set():
                 return
             new_findings = await asyncio.to_thread(scanner_fn)
@@ -365,10 +458,8 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
                     
                     deduped = _deduplicate_vulns(vulns)
                     
-                    # Clear incremental and re-save clean deduped findings
-                    await delete_scan_vulnerabilities(scan_id)
-                    for v in deduped:
-                        await save_vulnerability(scan_id, v)
+                    # Use delta-based incremental saving instead of delete-all/reinsert-all
+                    await _save_incremental(scan_id, deduped, saved_keys)
                     
                     await _publish(
                         r, scan_id, phase_name, phase_pct,
@@ -384,45 +475,70 @@ async def run_scan_task(target_url: str, scan_id: int) -> dict:
 
         def _sqli():
             scanner = SQLiScanner(session=_make_session())
-            for url in urls_with_params: scanner.scan_url_params(url)
-            for form in forms:           scanner.scan_form(form)
+            # Scan normal targets + alternate targets
+            for url in urls_with_params: 
+                scanner.scan_url_params(url)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    # Create base url and scan
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    scanner.scan_url_params(base_url)
+            for form in forms:           
+                scanner.scan_form(form)
             return scanner.get_results()
 
         def _xss():
             scanner = XSSScanner(session=_make_session())
-            for url in urls_with_params: scanner.scan_url_params(url)
-            for form in forms:           scanner.scan_form(form)
+            for url in urls_with_params: 
+                scanner.scan_url_params(url)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    scanner.scan_url_params(base_url)
+            for form in forms:           
+                scanner.scan_form(form)
             return scanner.get_results()
 
         def _ssti():
             from scanner.ssti_scanner import SSTIScanner
-            scanner = SSTIScanner(session=_make_session())
-            for url in urls_with_params: scanner.scan_url_params(url)
-            for form in forms:           scanner.scan_form(form)
+            # Pass detected tech signatures to optimize/prioritize template injections
+            scanner = SSTIScanner(session=_make_session(), tech_context=tech_signatures)
+            for url in urls_with_params: 
+                scanner.scan_url_params(url)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    scanner.scan_url_params(base_url)
+            for form in forms:           
+                scanner.scan_form(form)
             return scanner.get_results()
 
         def _misconfig():
-            from scanner.nmap_scanner import run_nmap_scan
             scanner = MisconfigScanner(session=_make_session())
-            if pages: scanner.scan_headers(pages[0])
+            # Scan headers for up to first 3 pages
+            for page in pages[:3]:
+                scanner.scan_headers(page)
             scanner.scan_sensitive_files(target_url)
+            # Scan sensitive files on discovered alternate ports
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    scanner.scan_sensitive_files(base_url)
             scanner.check_https(target_url)
-            results = scanner.get_results()
-            results.extend(run_nmap_scan(target_url, stop_event=stop_event))
-            return results
+            return scanner.get_results()
 
         def _advanced():
             scanner = AdvancedScanner(session=_make_session())
             scanner.run_all(target_url, pages, forms, urls_with_params)
             return scanner.get_results()
 
-        # Launch all 5 scanner groups concurrently
+        # Launch all 5 scanner groups concurrently (excluding nmap which ran sequentially first)
         await asyncio.gather(
-            _run_and_collect(_sqli,     "SQL Injection Testing",        30),
-            _run_and_collect(_xss,      "XSS Testing",                  40),
-            _run_and_collect(_ssti,     "SSTI Testing",                 50),
-            _run_and_collect(_misconfig,"Misconfig & Nmap Analysis",    60),
-            _run_and_collect(_advanced, "Advanced Security Checks",     70),
+            _run_and_collect(_sqli,     "SQL Injection Testing",        40),
+            _run_and_collect(_xss,      "XSS Testing",                  55),
+            _run_and_collect(_ssti,     "SSTI Testing",                 70),
+            _run_and_collect(_misconfig,"Misconfig Analysis",           80),
+            _run_and_collect(_advanced, "Advanced Security Checks",     88),
         )
 
         # ── Phase 7: Deduplicate + Save ───────────────────────────────────────
@@ -519,6 +635,7 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
     all_findings: list = []
     cancel_event  = asyncio.Event()
     stop_event    = threading.Event()
+    saved_keys: dict = {}  # key -> dict of vulnerability details for delta tracking
 
     if not target_url.startswith(("http://", "https://")):
         target_url = "http://" + target_url
@@ -581,19 +698,72 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
         pages            = crawl_data["pages"]
         forms            = crawl_data["forms"]
         urls_with_params = crawl_data["urls_with_params"]
+        discovered_ports = crawl_data.get("discovered_ports", [])
+
+        # Build alternate port targets so SQLi, XSS, and SSTI scanners test them
+        parsed_target = urlparse(target_url)
+        target_hostname = parsed_target.hostname or target_url
+        
+        for port in discovered_ports:
+            # Construct http:// and https:// URLs for the non-standard port
+            for scheme in ["http", "https"]:
+                alt_url = f"{scheme}://{target_hostname}:{port}/"
+                # Add to pages to ensure other generic checks might pick them up
+                if not any(p["url"] == alt_url for p in pages):
+                    pages.append({
+                        "url": alt_url,
+                        "status_code": 200,
+                        "headers": {},
+                    })
 
         await _publish(r, scan_id, "Crawling Complete", 5,
                        f"Found {len(pages)} pages, {len(forms)} forms, "
-                       f"{len(urls_with_params)} parameterised URLs",
+                       f"{len(urls_with_params)} parameterised URLs. Discovered non-standard ports: {discovered_ports}",
                        vulns_found=0)
 
         # ── Phase 2: Concurrent Baseline Scan ────────────────────────────────
         if cancel_event.is_set():
             return await _finish_cancelled(r, scan_id, all_findings, start_time)
 
-        await _publish(r, scan_id, "Baseline Scan", 6,
-                       "Running traditional security checks in parallel (SQLi, XSS, SSTI, Nmap)...",
-                       vulns_found=0)
+        # Pre-emptive Nmap port scan to gather tech signatures for active fuzzers
+        nmap_findings = []
+        tech_signatures = []
+        
+        if not cancel_event.is_set():
+            await _publish(r, scan_id, "Nmap Port Scanning", 6,
+                           f"Running Nmap port scan on ports: {discovered_ports or 'default Fast Mode'}...",
+                           vulns_found=len(_deduplicate_vulns(all_findings)))
+            
+            from scanner.nmap_scanner import run_nmap_scan
+            nmap_findings = await asyncio.to_thread(run_nmap_scan, target_url, ports=discovered_ports, stop_event=stop_event)
+            
+            # Parse Nmap findings/output/evidence for technology signatures
+            known_signatures = ["Werkzeug", "Gunicorn", "Python", "Node", "Ruby", "Spring", "Flask", "Django", "Java", "Express"]
+            for f in nmap_findings:
+                evidence_text = f.get("evidence", "") + " " + f.get("description", "")
+                for sig in known_signatures:
+                    if sig.lower() in evidence_text.lower() and sig not in tech_signatures:
+                        tech_signatures.append(sig)
+            
+            async with findings_lock:
+                if not cancel_event.is_set():
+                    if nmap_findings:
+                        all_findings.extend(nmap_findings)
+                    deduped = _deduplicate_vulns(all_findings)
+                    await _save_incremental(scan_id, deduped, saved_keys)
+                    await _publish(
+                        r, scan_id, "Baseline Scan", 6,
+                        f"Baseline: Nmap Complete — {len(nmap_findings) if nmap_findings else 0} finding(s) (total: {len(deduped)}). Tech signatures: {tech_signatures}",
+                        vulns_found=len(deduped),
+                        vulnerabilities=deduped,
+                    )
+
+        if cancel_event.is_set():
+            return await _finish_cancelled(r, scan_id, all_findings, start_time)
+
+        await _publish(r, scan_id, "Baseline Scan", 7,
+                       "Running traditional security checks in parallel (SQLi, XSS, SSTI)...",
+                       vulns_found=len(_deduplicate_vulns(all_findings)))
 
         def _make_session():
             s = _req.Session()
@@ -611,12 +781,10 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
                     
                     deduped = _deduplicate_vulns(all_findings)
                     
-                    await delete_scan_vulnerabilities(scan_id)
-                    for v in deduped:
-                        await save_vulnerability(scan_id, v)
+                    await _save_incremental(scan_id, deduped, saved_keys)
                         
                     await _publish(
-                        r, scan_id, "Baseline Scan", 6,
+                        r, scan_id, "Baseline Scan", 7,
                         f"Baseline: {label} — {len(new_findings) if new_findings else 0} finding(s) (total: {len(deduped)})",
                         vulns_found=len(deduped),
                         vulnerabilities=deduped,
@@ -626,6 +794,10 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
             from scanner.sqli_scanner import SQLiScanner
             s = SQLiScanner(session=_make_session())
             for u in urls_with_params: s.scan_url_params(u)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    s.scan_url_params(base_url)
             for f in forms:            s.scan_form(f)
             return s.get_results()
 
@@ -633,26 +805,36 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
             from scanner.xss_scanner import XSSScanner
             s = XSSScanner(session=_make_session())
             for u in urls_with_params: s.scan_url_params(u)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    s.scan_url_params(base_url)
             for f in forms:            s.scan_form(f)
             return s.get_results()
 
         def _ssti():
             from scanner.ssti_scanner import SSTIScanner
-            s = SSTIScanner(session=_make_session())
+            s = SSTIScanner(session=_make_session(), tech_context=tech_signatures)
             for u in urls_with_params: s.scan_url_params(u)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    s.scan_url_params(base_url)
             for f in forms:            s.scan_form(f)
             return s.get_results()
 
         def _misconfig():
             from scanner.misconfig_scanner import MisconfigScanner
-            from scanner.nmap_scanner import run_nmap_scan
             ms = MisconfigScanner(session=_make_session())
-            if pages: ms.scan_headers(pages[0])
+            for page in pages[:3]:
+                ms.scan_headers(page)
             ms.scan_sensitive_files(target_url)
+            for port in discovered_ports:
+                for scheme in ["http", "https"]:
+                    base_url = f"{scheme}://{target_hostname}:{port}/"
+                    ms.scan_sensitive_files(base_url)
             ms.check_https(target_url)
-            results = ms.get_results()
-            results.extend(run_nmap_scan(target_url, stop_event=stop_event))
-            return results
+            return ms.get_results()
 
         def _advanced():
             from scanner.advanced_scanner import AdvancedScanner
@@ -665,11 +847,11 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
             _baseline_run_and_collect(_sqli,     "SQL Injection"),
             _baseline_run_and_collect(_xss,      "XSS"),
             _baseline_run_and_collect(_ssti,     "SSTI"),
-            _baseline_run_and_collect(_misconfig,"Misconfig & Nmap"),
+            _baseline_run_and_collect(_misconfig,"Misconfig"),
             _baseline_run_and_collect(_advanced, "Advanced Checks"),
         )
 
-        await _publish(r, scan_id, "Baseline Complete", 7,
+        await _publish(r, scan_id, "Baseline Complete", 8,
                        f"Baseline scan done — {len(all_findings)} findings so far",
                        vulns_found=len(all_findings))
 
@@ -717,9 +899,7 @@ async def run_ai_scan_task(target_url: str, scan_id: int) -> dict:
                         
                         deduped = _deduplicate_vulns(all_findings)
                         
-                        await delete_scan_vulnerabilities(scan_id)
-                        for v in deduped:
-                            await save_vulnerability(scan_id, v)
+                        await _save_incremental(scan_id, deduped, saved_keys)
                             
                         completed[0] += 1
                         pct = min(92, 8 + completed[0] * (84 // total_phases))

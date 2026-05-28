@@ -247,13 +247,13 @@ def _parse_security_headers(nmap_output: str, target_url: str) -> list[dict]:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_nmap_scan(target_url: str, stop_event=None) -> list[dict]:
+def run_nmap_scan(target_url: str, ports: list[int] = None, stop_event=None) -> list[dict]:
     """
     Run a stealthy Nmap infrastructure scan against the target.
 
     Flags used:
-        -F      : Scan top 100 ports only
-        -T2     : Polite/quiet timing — slower but avoids IDS/WAF detection
+        -p <ports> or -F : Scan specified ports (or top 100 ports if none provided)
+        -T4     : Aggressive timing (extremely fast, prevents timeouts)
         -Pn     : Skip host ping check
         -sV     : Detect service and version information
         --script=http-security-headers : Check for missing HTTP security headers
@@ -284,9 +284,25 @@ def run_nmap_scan(target_url: str, stop_event=None) -> list[dict]:
     host = _extract_host(target_url)
 
     nmap_exe = _get_nmap_path() or "nmap"
+    
+    # Build port argument dynamically if ports are provided
+    port_arg = "-F"
+    if ports:
+        # Include standard ports 80 and 443 along with the discovered ones
+        full_ports = set(ports)
+        full_ports.add(80)
+        full_ports.add(443)
+        # Format as sorted comma-separated string
+        port_list_str = ",".join(str(p) for p in sorted(full_ports))
+        port_arg_list = ["-p", port_list_str]
+    else:
+        port_arg_list = ["-F"]
+
     cmd = [
         nmap_exe,
-        "-F",                              # Top 100 ports only
+    ]
+    cmd.extend(port_arg_list)
+    cmd.extend([
         "-T4",                             # Aggressive timing (extremely fast, prevents timeouts)
         "-Pn",                             # Skip host discovery
         "-sV",                             # Service/version detection
@@ -296,7 +312,7 @@ def run_nmap_scan(target_url: str, stop_event=None) -> list[dict]:
         "--max-scan-delay", "20ms",        # Prevent WAF rate-limiting from slowing Nmap to a crawl
         "--host-timeout", "45s",           # Standard limit: tell Nmap to stop scanning this host if it takes > 45s
         host,
-    ]
+    ])
 
     try:
         proc = subprocess.Popen(

@@ -1,4 +1,8 @@
+import sys
+sys.path.insert(0, ".")
 import asyncio
+from dotenv import load_dotenv
+load_dotenv()
 from models.auth_db import create_user
 
 async def main():
